@@ -1,0 +1,30 @@
+{
+  "name": "sip-to-openai",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ringcentral/ringcentral-gpt-live.git"
+  },
+  "homepage": "https://github.com/ringcentral/ringcentral-gpt-live#readme",
+  "bugs": {
+    "url": "https://github.com/ringcentral/ringcentral-gpt-live/issues"
+  },
+  "description": "GPT-Live webhook handler with a raw SIP/SDES-SRTP test caller",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start:live": "node --env-file=.env.live src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "call": "node --env-file=.env src/call.js",
+    "call:live": "node --env-file=.env.live src/call.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "openai": "^6.47.0",
+    "ws": "^8.21.1"
+  }
+}
