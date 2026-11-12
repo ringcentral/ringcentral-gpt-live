@@ -41,6 +41,18 @@ function loggedMessage(event) {
   return JSON.stringify(redactAudioPayloads(event));
 }
 
+function isUsableSocket(socket) {
+  return Boolean(socket)
+    && typeof socket.on === "function"
+    && typeof socket.send === "function"
+    && typeof socket.close === "function";
+}
+
+function serverErrorText(error) {
+  if (!error || typeof error !== "object") return "unknown error";
+  return [error.code ?? error.type, error.message].filter(Boolean).join(": ") || "unknown error";
+}
+
 export function monitorLiveSession(sessionId, {
   apiKey,
   initialSpokenGreeting,
@@ -50,6 +62,9 @@ export function monitorLiveSession(sessionId, {
   eventIdFactory = randomUUID,
   toolExecutor,
   onClose = () => {},
+  reattachDelaysMs = [250, 1_000, 3_000],
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
 } = {}) {
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     throw new Error("A session_id is required for Live sideband monitoring");
@@ -57,32 +72,42 @@ export function monitorLiveSession(sessionId, {
   if (!apiKey) throw new Error("OPENAI_API_KEY is required for Live sideband monitoring");
 
   const url = `wss://api.openai.com/v1/live/sessions/${encodeURIComponent(sessionId)}/attach`;
-  const socket = webSocketFactory(url, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-  if (
-    !socket
-    || typeof socket.on !== "function"
-    || typeof socket.send !== "function"
-    || typeof socket.close !== "function"
-  ) {
-    throw new Error("Live sideband WebSocket factory returned an invalid socket");
-  }
 
-  const monitor = {
-    socket,
-    send(event) {
-      const message = JSON.stringify(event);
-      if (logMessages) logger.log(`[WebSocket OUTBOUND ${sessionId}]\n${loggedMessage(event)}`);
-      socket.send(message);
-    },
-    close({ code = 1000, reason = "" } = {}) {
-      socket.close(code, reason);
-    },
-  };
+  // Everything below is scoped to the session, not to one socket, so it survives a re-attach.
+  let socket;
+  let closeRequested = false;
+  let sessionClosed = false;
+  let reattachAttempts = 0;
+  let reattachTimer;
+  let detached = false;
+  const unsent = [];
   const handledToolCalls = new Set();
   let initialGreetingSent = false;
   let toolQueue = Promise.resolve();
+
+  const monitor = {
+    get socket() {
+      return socket;
+    },
+    send(event) {
+      const message = JSON.stringify(event);
+      if (logMessages) logger.log(`[WebSocket OUTBOUND ${sessionId}]\n${loggedMessage(event)}`);
+      // Between a drop and the next attach there is no socket to write to; hold the message.
+      if (detached) unsent.push(message);
+      else socket.send(message);
+    },
+    close({ code = 1000, reason = "" } = {}) {
+      closeRequested = true;
+      if (reattachTimer !== undefined) {
+        // The old socket is already closed, so no close event will report this.
+        clearTimeoutImpl(reattachTimer);
+        reattachTimer = undefined;
+        onClose(monitor);
+        return;
+      }
+      socket.close(code, reason);
+    },
+  };
 
   const handleToolCall = (item) => {
     if (!toolExecutor || item?.type !== "function_call" || handledToolCalls.has(item.call_id)) return;
@@ -111,7 +136,7 @@ export function monitorLiveSession(sessionId, {
     });
   };
 
-  socket.on("message", (data) => {
+  const handleMessage = (data) => {
     const raw = messageText(data);
 
     let event;
@@ -125,6 +150,13 @@ export function monitorLiveSession(sessionId, {
     if (logMessages) {
       logger.log(`[WebSocket INBOUND ${sessionId}]\n${loggedMessage(event)}`);
     }
+    if (event === null || typeof event !== "object" || Array.isArray(event)) {
+      logger.error(`Live sideband received a non-object frame for ${sessionId}.`);
+      return;
+    }
+    // Session traffic proves the attach works, so a later drop gets the full retry budget
+    // again. An error frame proves nothing: an attach that is only ever refused must run out.
+    if (event.type !== "error" && event.type !== "transport.failed") reattachAttempts = 0;
 
     if (logMessages && event.type === "session.input_transcript.delta") {
       const text = oneLine(event.delta);
@@ -134,33 +166,85 @@ export function monitorLiveSession(sessionId, {
       const text = oneLine(event.delta);
       if (text) logger.log(`TEXT>>AI: ${text}`);
     }
+    if (event.type === "error") {
+      logger.error(`Live sideband reported an error for ${sessionId}: ${serverErrorText(event.error)}`);
+    }
+    if (event.type === "transport.failed") {
+      logger.error(`Live transport failed for ${sessionId}: ${serverErrorText(event.error)}`);
+    }
+    if (event.type === "session.closed") {
+      sessionClosed = true;
+      logger.log(`Live session ${sessionId} closed (reason: ${oneLine(event.reason) || "unknown"}).`);
+    }
     if (event.type === "response.event" && event.event?.type === "response.output_item.done") {
       handleToolCall(event.event.item);
     }
-  });
-  socket.on("error", (error) => {
-    logger.error(`Live sideband monitor error for ${sessionId}: ${errorText(error)}`);
-  });
-  socket.on("open", () => {
-    logger.log(`Live sideband monitor connected for ${sessionId}.`);
-    if (initialSpokenGreeting && !initialGreetingSent) {
-      initialGreetingSent = true;
-      monitor.send({
-        type: "session.commentary.append",
-        event_id: eventIdFactory(),
-        delegation_id: null,
-        content: initialSpokenGreeting,
-      });
-    }
-  });
-  socket.on("close", (code, reason) => {
+  };
+
+  const handleClose = (code, reason) => {
     const detail = messageText(reason).trim();
     logger.log(
       `Live sideband monitor closed for ${sessionId} (code ${code}${detail ? `: ${detail}` : ""}).`,
     );
-    onClose(monitor);
-  });
+    const delay = reattachDelaysMs[reattachAttempts];
+    // Close codes are undocumented; only a normal closure is taken to mean the call is over.
+    if (closeRequested || sessionClosed || code === 1000 || delay === undefined) {
+      // Nothing will deliver held messages now; later sends fail loudly instead of queueing.
+      detached = false;
+      if (unsent.length > 0) {
+        logger.error(`Live sideband monitor for ${sessionId} dropped ${unsent.length} unsent message(s).`);
+        unsent.length = 0;
+      }
+      onClose(monitor);
+      return;
+    }
+    reattachAttempts += 1;
+    detached = true;
+    logger.error(
+      `Live sideband monitor dropped for ${sessionId} while the session is still open; `
+        + `re-attaching in ${delay}ms (attempt ${reattachAttempts} of ${reattachDelaysMs.length}).`,
+    );
+    reattachTimer = setTimeoutImpl(() => {
+      reattachTimer = undefined;
+      try {
+        attach();
+      } catch (error) {
+        logger.error(`Live sideband monitor could not re-attach for ${sessionId}: ${errorText(error)}`);
+        onClose(monitor);
+      }
+    }, delay);
+  };
 
+  function attach() {
+    const next = webSocketFactory(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!isUsableSocket(next)) {
+      throw new Error("Live sideband WebSocket factory returned an invalid socket");
+    }
+    socket = next;
+    next.on("message", handleMessage);
+    next.on("error", (error) => {
+      logger.error(`Live sideband monitor error for ${sessionId}: ${errorText(error)}`);
+    });
+    next.on("open", () => {
+      logger.log(`Live sideband monitor connected for ${sessionId}.`);
+      detached = false;
+      for (const message of unsent.splice(0)) next.send(message);
+      if (initialSpokenGreeting && !initialGreetingSent) {
+        initialGreetingSent = true;
+        monitor.send({
+          type: "session.commentary.append",
+          event_id: eventIdFactory(),
+          delegation_id: null,
+          content: initialSpokenGreeting,
+        });
+      }
+    });
+    next.on("close", handleClose);
+  }
+
+  attach();
   logger.log(`Opening Live sideband monitor for ${sessionId}...`);
   return monitor;
 }

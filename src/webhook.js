@@ -113,22 +113,39 @@ export async function acceptLiveSession(sessionId, {
     };
   }
 
-  const response = await fetchImpl(
-    `https://api.openai.com/v1/live/sessions/${encodeURIComponent(sessionId)}/accept`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+  let response;
+  try {
+    response = await fetchImpl(
+      `https://api.openai.com/v1/live/sessions/${encodeURIComponent(sessionId)}/accept`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ session }),
+        signal: AbortSignal.timeout(timeoutMs),
       },
-      body: JSON.stringify({ session }),
-      signal: AbortSignal.timeout(timeoutMs),
-    },
-  );
+    );
+  } catch (cause) {
+    // No HTTP response arrived, so OpenAI may or may not have accepted the session.
+    const error = new Error(
+      `OpenAI call acceptance did not complete: ${cause instanceof Error ? cause.message : cause}`,
+      { cause },
+    );
+    error.ambiguous = true;
+    throw error;
+  }
 
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 1_000);
-    throw new Error(`OpenAI call acceptance failed (${response.status}): ${detail || response.statusText}`);
+    const error = new Error(
+      `OpenAI call acceptance failed (${response.status}): ${detail || response.statusText}`,
+    );
+    error.status = response.status;
+    // The first accept or reject wins; a later one reports this documented error code.
+    error.alreadyDecided = detail.includes("decision_already_made");
+    throw error;
   }
 }
 
@@ -183,6 +200,8 @@ export function createWebhookServer({
   if (typeof acceptCall !== "function") throw new Error("An acceptCall function is required");
   const seen = new Set();
   const decidedSessions = new Set();
+  // Session ID -> promise of whether the decision in progress succeeded.
+  const inFlight = new Map();
 
   const remember = (set, value) => {
     set.add(value);
@@ -234,29 +253,21 @@ export function createWebhookServer({
 
     const headerId = request.headers["webhook-id"];
     const deliveryId = (Array.isArray(headerId) ? headerId[0] : headerId) || event.id;
-    if (deliveryId && seen.has(deliveryId)) {
+    if ((deliveryId && seen.has(deliveryId)) || decidedSessions.has(sessionId)) {
       send(response, 200, "duplicate\n");
       return;
     }
-    if (deliveryId) {
-      remember(seen, deliveryId);
-    }
-    if (decidedSessions.has(sessionId)) {
-      send(response, 200, "duplicate\n");
+    const pending = inFlight.get(sessionId);
+    if (pending) {
+      // Mirror the delivery already deciding this session, so that a failure stays retryable.
+      if (await pending) send(response, 200, "duplicate\n");
+      else send(response, 502, "call acceptance failed\n");
       return;
     }
-    remember(decidedSessions, sessionId);
+    let settle;
+    inFlight.set(sessionId, new Promise((resolve) => { settle = resolve; }));
 
-    try {
-      /*if (!authorizeCall(event)) {
-        logger.warn(`Rejecting incoming Live session ${sessionId}: caller token did not match`);
-        if (typeof rejectCall === "function") await rejectCall(sessionId);
-        send(response, 200, "rejected\n");
-        return;
-      }*/
-      logger.log(`Caller token ignored.`);
-      logger.log(`Verified incoming Live session ${sessionId}; accepting it...`);
-      await acceptCall(sessionId);
+    const startMonitor = () => {
       try {
         const monitorResult = monitorCall?.(sessionId);
         if (monitorResult && typeof monitorResult.catch === "function") {
@@ -267,13 +278,48 @@ export function createWebhookServer({
       } catch (error) {
         logger.error(`Live sideband monitor failed for ${sessionId}: ${error instanceof Error ? error.message : error}`);
       }
-      send(response, 200, "accepted\n");
+    };
+
+    let accepted = false;
+    try {
+      /*if (!authorizeCall(event)) {
+        logger.warn(`Rejecting incoming Live session ${sessionId}: caller token did not match`);
+        if (typeof rejectCall === "function") await rejectCall(sessionId);
+        send(response, 200, "rejected\n");
+        return;
+      }*/
+      logger.log(`Caller token ignored.`);
+      logger.log(`Verified incoming Live session ${sessionId}; accepting it...`);
+      await acceptCall(sessionId);
+      accepted = true;
     } catch (error) {
-      if (deliveryId) seen.delete(deliveryId);
-      decidedSessions.delete(sessionId);
-      logger.error(error instanceof Error ? error.message : error);
-      send(response, 502, "call acceptance failed\n");
+      if (error?.alreadyDecided) {
+        // An earlier attempt whose response was lost did decide this session.
+        logger.warn(`Live session ${sessionId} was already decided; treating it as accepted.`);
+        accepted = true;
+      } else {
+        logger.error(error instanceof Error ? error.message : error);
+        // The accept may have succeeded without us seeing the response. Attach anyway so a
+        // live call is not left without tool handling; attaching to an unaccepted session fails.
+        if (error?.ambiguous) startMonitor();
+      }
+    } finally {
+      // A response already sent inside the try block is a final decision too.
+      const decided = accepted || response.writableEnded;
+      if (decided) {
+        if (deliveryId) remember(seen, deliveryId);
+        remember(decidedSessions, sessionId);
+      }
+      inFlight.delete(sessionId);
+      settle(decided);
     }
+    if (response.writableEnded) return;
+    if (!accepted) {
+      send(response, 502, "call acceptance failed\n");
+      return;
+    }
+    startMonitor();
+    send(response, 200, "accepted\n");
   };
 
   const server = http.createServer((request, response) => {

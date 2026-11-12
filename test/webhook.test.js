@@ -338,3 +338,112 @@ test("rejectLiveSession sends SIP status 603 to the Live reject action", async (
   assert.equal(captured.url, "https://api.openai.com/v1/live/sessions/live_test/reject");
   assert.deepEqual(JSON.parse(captured.options.body), { status_code: 603 });
 });
+
+function incomingEvent(sessionId, id = `evt_${sessionId}`) {
+  return { id, type: "live.transport.incoming", data: { type: "sip", session_id: sessionId } };
+}
+
+test("a duplicate arriving while the first accept is in flight mirrors its outcome", async (t) => {
+  for (const outcome of ["success", "failure"]) {
+    let finishAccept;
+    let attempts = 0;
+    let deliveries = 0;
+    const server = createWebhookServer({
+      unwrap: async () => incomingEvent(`live_race_${outcome}`, `evt_${outcome}_${deliveries++}`),
+      acceptCall: () => {
+        attempts += 1;
+        return new Promise((resolve, reject) => {
+          finishAccept = () => (outcome === "success" || attempts > 1
+            ? resolve()
+            : reject(new Error("accept failed")));
+        });
+      },
+      logger: quietLogger,
+    });
+    t.after(() => close(server));
+    const origin = await listen(server);
+    const post = () => fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
+
+    const first = post();
+    while (!finishAccept) await new Promise((resolve) => setImmediate(resolve));
+    const duplicate = post();
+    // Let the duplicate reach the handler before the first accept settles.
+    while (deliveries < 2) await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    finishAccept();
+    const [firstResponse, duplicateResponse] = await Promise.all([first, duplicate]);
+
+    if (outcome === "success") {
+      assert.equal(await firstResponse.text(), "accepted\n");
+      assert.equal(duplicateResponse.status, 200);
+      assert.equal(await duplicateResponse.text(), "duplicate\n");
+    } else {
+      assert.equal(firstResponse.status, 502);
+      // Acknowledging the duplicate here would stop the sender from ever retrying.
+      assert.equal(duplicateResponse.status, 502);
+      finishAccept = undefined;
+      const retry = post();
+      while (!finishAccept) await new Promise((resolve) => setImmediate(resolve));
+      finishAccept();
+      assert.equal(await (await retry).text(), "accepted\n");
+    }
+    assert.equal(attempts, outcome === "success" ? 1 : 2);
+  }
+});
+
+test("an accept with no HTTP response still attaches the monitor and stays retryable", async (t) => {
+  const monitored = [];
+  let attempts = 0;
+  const server = createWebhookServer({
+    unwrap: async () => incomingEvent("live_ambiguous", `evt_ambiguous_${attempts}`),
+    acceptCall: (sessionId) => {
+      attempts += 1;
+      return acceptLiveSession(sessionId, {
+        apiKey: "sk-test",
+        fetchImpl: async () => {
+          if (attempts === 1) throw new DOMException("The operation timed out", "TimeoutError");
+          return new Response(
+            JSON.stringify({ error: { code: "decision_already_made" } }),
+            { status: 409 },
+          );
+        },
+      });
+    },
+    monitorCall: (sessionId) => { monitored.push(sessionId); },
+    logger: quietLogger,
+  });
+  t.after(() => close(server));
+  const origin = await listen(server);
+
+  const first = await fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
+  assert.equal(first.status, 502);
+  assert.deepEqual(monitored, ["live_ambiguous"]);
+
+  const retry = await fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
+  assert.equal(retry.status, 200);
+  assert.equal(await retry.text(), "accepted\n");
+  assert.deepEqual(monitored, ["live_ambiguous", "live_ambiguous"]);
+
+  const later = await fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
+  assert.equal(await later.text(), "duplicate\n");
+  assert.equal(attempts, 2);
+});
+
+test("a definite accept failure does not attach the monitor", async (t) => {
+  const monitored = [];
+  const server = createWebhookServer({
+    unwrap: async () => incomingEvent("live_refused"),
+    acceptCall: (sessionId) => acceptLiveSession(sessionId, {
+      apiKey: "sk-test",
+      fetchImpl: async () => new Response("bad session", { status: 400 }),
+    }),
+    monitorCall: (sessionId) => { monitored.push(sessionId); },
+    logger: quietLogger,
+  });
+  t.after(() => close(server));
+  const origin = await listen(server);
+
+  const response = await fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
+  assert.equal(response.status, 502);
+  assert.deepEqual(monitored, []);
+});

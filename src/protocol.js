@@ -1,5 +1,6 @@
 import { isIPv4 } from "node:net";
-import { parseSdesCryptoAttributes, SDES_SRTP_SUITE } from "./srtp.js";
+import { parseSdesCryptoAttributes, rtpHeaderLength, SDES_SRTP_SUITE } from "./srtp.js";
+import { assertPort } from "./validation.js";
 
 const HEADER_END = Buffer.from("\r\n\r\n", "ascii");
 const COMPACT_HEADERS = new Map([
@@ -217,9 +218,7 @@ export function createSdpOffer({
   sessionId = Date.now(),
 }) {
   if (!isIPv4(address)) throw new Error("RTP advertised address must be an IPv4 address");
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("RTP port must be between 1 and 65535");
-  }
+  assertPort(port, "RTP port");
   if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
     throw new Error("SDP session ID must be a positive integer");
   }
@@ -344,22 +343,11 @@ export function extractRtpPayload(packet, expectedPayloadType = 0) {
   if (!Buffer.isBuffer(packet) && !(packet instanceof Uint8Array)) return undefined;
 
   const bytes = Buffer.isBuffer(packet) ? packet : Buffer.from(packet);
-  if (bytes.length < 12 || (bytes[0] >> 6) !== 2) return undefined;
+  const payloadStart = rtpHeaderLength(bytes);
+  if (payloadStart === undefined) return undefined;
   if ((bytes[1] & 0x7f) !== expectedPayloadType) return undefined;
 
   const hasPadding = (bytes[0] & 0x20) !== 0;
-  const hasExtension = (bytes[0] & 0x10) !== 0;
-  const csrcCount = bytes[0] & 0x0f;
-  let payloadStart = 12 + (csrcCount * 4);
-  if (payloadStart > bytes.length) return undefined;
-
-  if (hasExtension) {
-    if (payloadStart + 4 > bytes.length) return undefined;
-    const extensionWords = bytes.readUInt16BE(payloadStart + 2);
-    payloadStart += 4 + (extensionWords * 4);
-    if (payloadStart > bytes.length) return undefined;
-  }
-
   let payloadEnd = bytes.length;
   if (hasPadding) {
     const paddingBytes = bytes[bytes.length - 1];

@@ -24,9 +24,11 @@ import {
 } from "./protocol.js";
 import { openPcmuRecorder } from "./pcmu-recording.js";
 import { createSdesKeyMaterial, SrtpContext } from "./srtp.js";
+import { assertPort, assertSipCallToken } from "./validation.js";
 
 const USER_AGENT = "openai-sip-minimal/1.0";
 const MAX_SIP_DIAGNOSTIC_LENGTH = 1_000;
+const CANCEL_WAIT_MS = 3_000;
 
 export function logSipMessage(logger, enabled, direction, raw) {
   if (!enabled) return;
@@ -79,13 +81,6 @@ function validateHost(host) {
   return host;
 }
 
-function validatePort(port, label) {
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`${label} must be between 1 and 65535`);
-  }
-  return port;
-}
-
 function getCSeq(message) {
   const value = getHeader(message, "cseq") ?? "";
   const match = value.match(/^(\d+)\s+([A-Z]+)$/i);
@@ -118,17 +113,15 @@ export class SipCall {
     pcmuAudio = Buffer.alloc(0),
     incomingAudioFile,
     recordingFactory = openPcmuRecorder,
+    tlsConnect = tls.connect,
   }) {
     if (typeof projectId !== "string" || !/^proj_[A-Za-z0-9_-]+$/.test(projectId)) {
       throw new Error("OPENAI_PROJECT_ID must be a proj_... project ID");
     }
-    if (typeof callToken !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(callToken)) {
-      throw new Error("SIP_CALL_TOKEN must contain 16-64 letters, digits, underscores, or hyphens");
-    }
     this.projectId = projectId;
-    this.callToken = callToken;
+    this.callToken = assertSipCallToken(callToken);
     this.sipHost = validateHost(sipHost);
-    this.sipPort = validatePort(Number(sipPort), "SIP_PORT");
+    this.sipPort = assertPort(Number(sipPort), "SIP_PORT");
     this.rtpPort = Number(rtpPort);
     if (
       !Number.isInteger(this.rtpPort)
@@ -164,6 +157,8 @@ export class SipCall {
     this.pcmuAudio = pcmuAudio;
     this.incomingAudioFile = incomingAudioFile?.trim();
     this.recordingFactory = recordingFactory;
+    if (typeof tlsConnect !== "function") throw new Error("TLS connect must be a function");
+    this.tlsConnect = tlsConnect;
     this.events = new EventEmitter();
     this.decoder = new SipMessageDecoder();
     this.state = "new";
@@ -192,30 +187,29 @@ export class SipCall {
       this.#writeSipMessage(this.ackBytes);
       this.state = "established";
 
-      let media;
+      // From here the remote session exists, so every way out of this block ends it with a BYE.
       try {
-        media = parseSdpAnswer(finalResponse.body);
-      } catch (error) {
-        await this.#sendBye();
-        throw error;
-      }
+        this.#startRtp(parseSdpAnswer(finalResponse.body));
+        if (this.pcmuAudio.length > 0) {
+          const audioSeconds = (this.pcmuAudio.length / PCMU_BYTES_PER_SECOND).toFixed(3);
+          this.logger.log(
+            `Call established; sending ${audioSeconds}s of PCMU audio, then silence, `
+              + `for up to ${this.durationMs / 1000}s total.`,
+          );
+        } else {
+          this.logger.log(`Call established; sending PCMU silence for up to ${this.durationMs / 1000}s.`);
+        }
+        await this.#waitForDurationOrStop();
 
-      this.#startRtp(media);
-      if (this.pcmuAudio.length > 0) {
-        const audioSeconds = (this.pcmuAudio.length / PCMU_BYTES_PER_SECOND).toFixed(3);
-        this.logger.log(
-          `Call established; sending ${audioSeconds}s of PCMU audio, then silence, `
-            + `for up to ${this.durationMs / 1000}s total.`,
-        );
-      } else {
-        this.logger.log(`Call established; sending PCMU silence for up to ${this.durationMs / 1000}s.`);
-      }
-      await this.#waitForDurationOrStop();
-
-      if (this.fatalError) throw this.fatalError;
-
-      if (!this.remoteEnded && this.socket && !this.socket.destroyed) {
-        await this.#sendBye();
+        if (this.fatalError) throw this.fatalError;
+      } finally {
+        if (!this.remoteEnded && this.socket && !this.socket.destroyed) {
+          try {
+            await this.#sendBye();
+          } catch (error) {
+            this.logger.warn(`Could not send SIP BYE: ${error instanceof Error ? error.message : error}`);
+          }
+        }
       }
       this.logger.log(`Call ended. RTP packets sent: ${this.rtpSent}; received: ${this.rtpReceived}.`);
     } finally {
@@ -226,8 +220,13 @@ export class SipCall {
   stop() {
     this.stopRequested = true;
     this.resolveStop();
-    if (this.state === "connecting" || this.state === "inviting") {
+    if (this.state === "connecting") {
       this.#fail(new Error("Call stopped by user"));
+    } else if (this.state === "inviting") {
+      // The INVITE is on the wire; give it up in a way that lets us CANCEL it first.
+      const error = new Error("Call stopped by user");
+      error.abandoned = true;
+      this.events.emit("abandon", error);
     }
   }
 
@@ -295,7 +294,7 @@ export class SipCall {
   async #connectTls() {
     this.state = "connecting";
     this.logger.log(`Connecting to ${this.sipHost}:${this.sipPort} with SIP over TLS...`);
-    this.socket = tls.connect({
+    this.socket = this.tlsConnect({
       host: this.sipHost,
       port: this.sipPort,
       servername: isIPv4(this.sipHost) ? undefined : this.sipHost,
@@ -381,20 +380,22 @@ export class SipCall {
       "Content-Type": "application/sdp",
     };
     const bytes = serializeSipRequest("INVITE", this.targetUri, headers, sdp);
+    const isFinalInviteResponse = (message) => {
+      const cseq = getCSeq(message);
+      return message.kind === "response"
+        && getHeader(message, "call-id") === this.callId
+        && cseq?.number === 1
+        && cseq.method === "INVITE"
+        && message.status >= 200;
+    };
     const responsePromise = this.#waitForMessage(
-      (message) => {
-        const cseq = getCSeq(message);
-        return message.kind === "response"
-          && getHeader(message, "call-id") === this.callId
-          && cseq?.number === 1
-          && cseq.method === "INVITE"
-          && message.status >= 200;
-      },
+      isFinalInviteResponse,
       this.inviteTimeoutMs,
       "Timed out waiting for a final SIP INVITE response. Check the webhook and /accept logs.",
       (message) => {
         const cseq = getCSeq(message);
         if (message.kind === "response" && cseq?.method === "INVITE" && message.status < 200) {
+          this.provisionalSeen = true;
           this.logger.log(`SIP ${message.status} ${message.reason}`.trim());
         }
       },
@@ -406,7 +407,45 @@ export class SipCall {
         + `(codec preference: ${this.preferOpus ? "unimplemented Opus PT 111, then PCMU PT 0" : "PCMU PT 0, then unimplemented Opus PT 111"}).`,
     );
     this.logger.log(`INVITE sent to ${this.targetUri}. Waiting for the signed webhook to accept it...`);
-    return responsePromise;
+    try {
+      return await responsePromise;
+    } catch (error) {
+      // Giving up on our side does not stop the server: without a CANCEL the webhook could
+      // still accept the session and leave it running with no caller.
+      if (error?.abandoned || error?.timedOut) await this.#cancelInvite(isFinalInviteResponse);
+      throw error;
+    }
+  }
+
+  async #cancelInvite(isFinalInviteResponse) {
+    // A CANCEL is only valid once the server has answered the INVITE provisionally.
+    if (!this.provisionalSeen || !this.socket || this.socket.destroyed) return;
+    try {
+      this.logger.log("Cancelling the pending INVITE...");
+      const finalResponse = this.#waitForMessage(
+        isFinalInviteResponse,
+        CANCEL_WAIT_MS,
+        "Timed out waiting for the cancelled SIP INVITE to end",
+      ).catch((error) => {
+        this.logger.warn(error.message);
+      });
+      this.#writeSipMessage(serializeSipRequest("CANCEL", this.targetUri, {
+        ...this.#baseHeaders(this.inviteBranch),
+        CSeq: "1 CANCEL",
+      }));
+      const response = await finalResponse;
+      if (!response) return;
+      if (response.status >= 300) {
+        this.#sendFailureAck(response);
+        return;
+      }
+      // The call was answered before the CANCEL took effect, so it has to be hung up instead.
+      this.#establishDialog(response);
+      this.#writeSipMessage(this.ackBytes);
+      await this.#sendBye();
+    } catch (error) {
+      this.logger.warn(`Could not cancel the SIP INVITE: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   #establishDialog(response) {
@@ -508,15 +547,40 @@ export class SipCall {
     return this.socket.write(bytes);
   }
 
-  #handleSipMessage(message) {
-    if (message.kind === "request" && message.method === "BYE") {
-      if (getHeader(message, "call-id") === this.callId) {
-        this.state = "terminating";
-        this.#writeSipMessage(serializeSipResponse(message, 200, "OK"));
-        this.remoteEnded = true;
-        if (this.rtpTimer) clearInterval(this.rtpTimer);
-        this.resolveStop();
+  #handleSipRequest(message) {
+    if (message.method === "ACK") return;
+    const respond = (status, reason) => {
+      try {
+        this.#writeSipMessage(serializeSipResponse(message, status, reason));
+      } catch (error) {
+        this.logger.warn(
+          `Could not answer SIP ${message.method}: ${error instanceof Error ? error.message : error}`,
+        );
       }
+    };
+    if (getHeader(message, "call-id") !== this.callId) {
+      respond(481, "Call/Transaction Does Not Exist");
+      return;
+    }
+    if (message.method === "BYE") {
+      this.state = "terminating";
+      respond(200, "OK");
+      this.remoteEnded = true;
+      if (this.rtpTimer) clearInterval(this.rtpTimer);
+      this.resolveStop();
+    } else if (message.method === "OPTIONS" || (message.method === "UPDATE" && message.body.length === 0)) {
+      respond(200, "OK");
+    } else if (message.method === "INVITE" || message.method === "UPDATE") {
+      // Renegotiation is not implemented; refusing it leaves the current media session in place.
+      respond(488, "Not Acceptable Here");
+    } else {
+      respond(501, "Not Implemented");
+    }
+  }
+
+  #handleSipMessage(message) {
+    if (message.kind === "request") {
+      this.#handleSipRequest(message);
       return;
     }
 
@@ -566,15 +630,19 @@ export class SipCall {
       };
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(timeoutMessage));
+        const error = new Error(timeoutMessage);
+        error.timedOut = true;
+        reject(error);
       }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
         this.events.off("message", onMessage);
         this.events.off("fatal", onFatal);
+        this.events.off("abandon", onFatal);
       };
       this.events.on("message", onMessage);
       this.events.on("fatal", onFatal);
+      this.events.on("abandon", onFatal);
     });
   }
 

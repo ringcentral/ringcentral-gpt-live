@@ -284,3 +284,234 @@ test("Live monitor validates required connection inputs", () => {
     /OPENAI_API_KEY is required/,
   );
 });
+
+function toolCallEvent(callId) {
+  return {
+    type: "response.event",
+    event: {
+      type: "response.output_item.done",
+      item: { type: "function_call", call_id: callId, name: "check_inventory", arguments: "{}" },
+    },
+  };
+}
+
+function manualTimers() {
+  const pending = [];
+  return {
+    pending,
+    setTimeoutImpl: (callback, delay) => {
+      const timer = { callback, delay };
+      pending.push(timer);
+      return timer;
+    },
+    clearTimeoutImpl: (timer) => {
+      const index = pending.indexOf(timer);
+      if (index >= 0) pending.splice(index, 1);
+    },
+    runNext: () => pending.shift().callback(),
+  };
+}
+
+test("Live monitor ignores JSON frames that are not objects", () => {
+  const socket = new FakeWebSocket();
+  const captured = capturingLogger();
+  monitorLiveSession("live_null", {
+    apiKey: "sk-test",
+    logger: captured.logger,
+    webSocketFactory: () => socket,
+  });
+
+  for (const frame of ["null", "[1]", "7", '"text"']) {
+    assert.doesNotThrow(() => socket.emit("message", Buffer.from(frame)));
+  }
+  assert.deepEqual(
+    captured.errors,
+    Array(4).fill("Live sideband received a non-object frame for live_null."),
+  );
+});
+
+test("Live monitor always logs server errors and the session close reason", () => {
+  const socket = new FakeWebSocket();
+  const captured = capturingLogger();
+  monitorLiveSession("live_errors", {
+    apiKey: "sk-test",
+    logger: captured.logger,
+    logMessages: false,
+    webSocketFactory: () => socket,
+  });
+
+  socket.emit("message", Buffer.from(JSON.stringify({
+    type: "error",
+    error: { type: "invalid_request_error", code: "unknown_call_id", message: "No such call" },
+  })));
+  socket.emit("message", Buffer.from(JSON.stringify({
+    type: "session.closed",
+    reason: "remote_hangup",
+  })));
+
+  assert.deepEqual(captured.errors, [
+    "Live sideband reported an error for live_errors: unknown_call_id: No such call",
+  ]);
+  assert.ok(captured.logs.includes("Live session live_errors closed (reason: remote_hangup)."));
+});
+
+test("Live monitor re-attaches after a drop and answers tool calls on the new socket", async () => {
+  const sockets = [];
+  const timers = manualTimers();
+  const executed = [];
+  let closed = 0;
+  const monitor = monitorLiveSession("live_drop", {
+    apiKey: "sk-test",
+    logger: capturingLogger().logger,
+    webSocketFactory: () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    toolExecutor: async (name, args) => {
+      executed.push(name);
+      return { status: "ok" };
+    },
+    initialSpokenGreeting: "Hello",
+    onClose: () => { closed += 1; },
+    ...timers,
+  });
+  sockets[0].emit("open");
+  sockets[0].emit("message", Buffer.from(JSON.stringify(toolCallEvent("call_before"))));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  sockets[0].emit("close", 1006, Buffer.alloc(0));
+  assert.equal(closed, 0);
+  assert.deepEqual(timers.pending.map((timer) => timer.delay), [250]);
+
+  // A result produced while detached is held, then delivered once the new socket opens.
+  monitor.send({ type: "held" });
+  timers.runNext();
+  assert.equal(sockets.length, 2);
+  assert.equal(monitor.socket, sockets[1]);
+  assert.deepEqual(sockets[1].sent, []);
+  sockets[1].emit("open");
+  assert.deepEqual(sockets[1].sent, ['{"type":"held"}']);
+
+  // The attach replays recent events; the already-answered call must not run again.
+  sockets[1].emit("message", Buffer.from(JSON.stringify(toolCallEvent("call_before"))));
+  sockets[1].emit("message", Buffer.from(JSON.stringify(toolCallEvent("call_after"))));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(executed, ["check_inventory", "check_inventory"]);
+  assert.equal(
+    sockets[1].sent.map(JSON.parse).filter((event) => event.type === "response.item.create")[0]
+      .item.call_id,
+    "call_after",
+  );
+  // The greeting was spoken on the first attach and is not repeated.
+  assert.equal(sockets[1].sent.some((message) => message.includes("commentary")), false);
+});
+
+test("Live monitor does not re-attach once the session is closed or it was asked to close", () => {
+  for (const ending of ["session.closed", "close()"]) {
+    const sockets = [];
+    const timers = manualTimers();
+    let closed = 0;
+    const monitor = monitorLiveSession("live_done", {
+      apiKey: "sk-test",
+      logger: capturingLogger().logger,
+      webSocketFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      onClose: () => { closed += 1; },
+      ...timers,
+    });
+    if (ending === "session.closed") {
+      sockets[0].emit("message", Buffer.from('{"type":"session.closed","reason":"remote_hangup"}'));
+    } else {
+      monitor.close();
+    }
+    sockets[0].emit("close", 1006, Buffer.alloc(0));
+
+    assert.equal(timers.pending.length, 0, ending);
+    assert.equal(sockets.length, 1, ending);
+    assert.equal(closed, 1, ending);
+  }
+});
+
+test("Live monitor gives up after its re-attach attempts and reports the close once", () => {
+  const sockets = [];
+  const timers = manualTimers();
+  let closed = 0;
+  const monitor = monitorLiveSession("live_gone", {
+    apiKey: "sk-test",
+    logger: capturingLogger().logger,
+    webSocketFactory: () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    onClose: () => { closed += 1; },
+    reattachDelaysMs: [10, 20],
+    ...timers,
+  });
+
+  sockets[0].emit("close", 1006, Buffer.alloc(0));
+  timers.runNext();
+  sockets[1].emit("close", 1006, Buffer.alloc(0));
+  assert.equal(closed, 0);
+  timers.runNext();
+  sockets[2].emit("close", 1006, Buffer.alloc(0));
+  assert.equal(closed, 1);
+  assert.equal(timers.pending.length, 0);
+
+  // Closing while a retry is pending cancels it and reports the close.
+  const waiting = monitorLiveSession("live_waiting", {
+    apiKey: "sk-test",
+    logger: capturingLogger().logger,
+    webSocketFactory: () => new FakeWebSocket(),
+    onClose: () => { closed += 1; },
+    ...timers,
+  });
+  waiting.socket.emit("close", 1006, Buffer.alloc(0));
+  assert.equal(timers.pending.length, 1);
+  waiting.close();
+  assert.equal(timers.pending.length, 0);
+  assert.equal(closed, 2);
+  assert.ok(monitor);
+});
+
+test("Live monitor stops re-attaching when every attach is only refused with an error", () => {
+  const sockets = [];
+  const timers = manualTimers();
+  const captured = capturingLogger();
+  let closed = 0;
+  const monitor = monitorLiveSession("live_refused", {
+    apiKey: "sk-test",
+    logger: captured.logger,
+    webSocketFactory: () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    onClose: () => { closed += 1; },
+    reattachDelaysMs: [10, 20],
+    ...timers,
+  });
+
+  for (let attach = 0; attach < 10 && closed === 0; attach += 1) {
+    const socket = sockets.at(-1);
+    socket.emit("open");
+    socket.emit("message", Buffer.from('{"type":"error","error":{"code":"session_not_found"}}'));
+    if (attach === 0) monitor.send({ type: "held" });
+    socket.emit("close", 1006, Buffer.alloc(0));
+    if (timers.pending.length > 0) {
+      if (attach === 0) monitor.send({ type: "held" });
+      timers.runNext();
+    }
+  }
+
+  assert.equal(sockets.length, 3);
+  assert.equal(closed, 1);
+  assert.equal(timers.pending.length, 0);
+  // After giving up, nothing is queued silently: the next send goes straight to the socket.
+  monitor.send({ type: "late" });
+  assert.deepEqual(sockets.at(-1).sent.at(-1), '{"type":"late"}');
+});

@@ -1,12 +1,12 @@
 import OpenAI from "openai";
 import { booleanFromEnvironment } from "./environment.js";
-import { monitorLiveSession } from "./live-monitor.js";
+import { createSessionMonitors } from "./live-session.js";
 import {
-  createStridewellStore,
   STRIDEWELL_BACKEND_INSTRUCTIONS,
   STRIDEWELL_LIVE_INSTRUCTIONS,
   STRIDEWELL_TOOLS,
 } from "./stridewell-agent.js";
+import { assertPort, assertSipCallToken } from "./validation.js";
 import {
   acceptLiveSession,
   createWebhookServer,
@@ -21,24 +21,20 @@ function required(name) {
 }
 
 function readPort() {
-  const port = Number(process.env.PORT || 3000);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("PORT must be between 1 and 65535");
-  }
-  return port;
+  return assertPort(Number(process.env.PORT || 3000), "PORT");
 }
 
 try {
   const apiKey = required("OPENAI_API_KEY");
   const webhookSecret = required("OPENAI_WEBHOOK_SECRET");
-  const callToken = required("SIP_CALL_TOKEN");
-  if (!/^[A-Za-z0-9_-]{16,64}$/.test(callToken)) {
-    throw new Error("SIP_CALL_TOKEN must contain 16-64 letters, digits, underscores, or hyphens");
-  }
+  const callToken = assertSipCallToken(required("SIP_CALL_TOKEN"));
   const client = new OpenAI({ apiKey, webhookSecret });
-  const activeMonitors = new Map();
-  const stridewellStore = createStridewellStore();
-  const logWebSocketMessages = booleanFromEnvironment("LOG_WEBSOCKET_MESSAGES");
+  const sessionMonitors = createSessionMonitors({
+    apiKey,
+    initialSpokenGreeting:
+      "Welcome to Stridewell Santa Clara. I'm the store's AI assistant. How can I help you today?",
+    logMessages: booleanFromEnvironment("LOG_WEBSOCKET_MESSAGES"),
+  });
   const server = createWebhookServer({
     unwrap: (rawBody, headers) => client.webhooks.unwrap(rawBody, headers),
     acceptCall: (sessionId) => acceptLiveSession(sessionId, {
@@ -53,28 +49,11 @@ try {
       tools: STRIDEWELL_TOOLS,
     }),
     authorizeCall: (event) => hasSipCallToken(event, callToken),
-    monitorCall: (sessionId) => {
-      if (activeMonitors.has(sessionId)) return activeMonitors.get(sessionId);
-      const monitor = monitorLiveSession(sessionId, {
-        apiKey,
-        initialSpokenGreeting:
-          "Welcome to Stridewell Santa Clara. I'm the store's AI assistant. How can I help you today?",
-        toolExecutor: (name, args) => stridewellStore.execute(name, args),
-        logMessages: logWebSocketMessages,
-        onClose: (closedMonitor) => {
-          if (activeMonitors.get(sessionId) === closedMonitor) activeMonitors.delete(sessionId);
-        },
-      });
-      activeMonitors.set(sessionId, monitor);
-      return monitor;
-    },
+    monitorCall: (sessionId) => sessionMonitors.monitorCall(sessionId),
     rejectCall: (sessionId) => rejectLiveSession(sessionId, { apiKey }),
   });
   server.on("close", () => {
-    for (const monitor of activeMonitors.values()) {
-      monitor.close({ code: 1001, reason: "Webhook server shutting down" });
-    }
-    activeMonitors.clear();
+    sessionMonitors.closeAll({ code: 1001, reason: "Webhook server shutting down" });
   });
   const host = process.env.HOST || "localhost";
   const port = readPort();

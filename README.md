@@ -16,7 +16,7 @@ src/server.js - accept + sideband WebSocket -> OpenAI
 GPT-Live ----- delegates tool work -> Responses model -> Stridewell tools
 ```
 
-GPT-Live handles the conversation. A separate Responses model decides which tools to call (store hours, inventory, holds). The tools live in `src/stridewell-agent.js` and keep state in memory, so restarting the server resets everything. The scenario is described in [`docs/stridewell-store-profile.md`](docs/stridewell-store-profile.md).
+GPT-Live handles the conversation. A separate Responses model decides which tools to call (store hours, inventory, holds). The tools live in `src/stridewell-agent.js` and keep state in memory per call, so every call starts from a fresh store and nothing carries over between callers. The scenario is described in [`docs/stridewell-store-profile.md`](docs/stridewell-store-profile.md).
 
 ## You'll need
 

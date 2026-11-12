@@ -39,7 +39,7 @@ export function deriveSrtpSessionKeys({ masterKey, masterSalt }) {
   };
 }
 
-function rtpHeaderLength(packet, packetEnd = packet.length) {
+export function rtpHeaderLength(packet, packetEnd = packet.length) {
   if (packetEnd < 12 || (packet[0] >> 6) !== 2) return undefined;
   let length = 12 + ((packet[0] & 0x0f) * 4);
   if (length > packetEnd) return undefined;
