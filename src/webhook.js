@@ -176,23 +176,10 @@ export async function rejectLiveSession(sessionId, {
   }
 }
 
-export function hasSipCallToken(event, token) {
-  if (typeof token !== "string" || token.length === 0) return false;
-  const headers = Array.isArray(event?.data?.sip_headers) ? event.data.sip_headers : [];
-  const from = headers.find((header) => String(header?.name).toLowerCase() === "from")?.value;
-  if (typeof from !== "string") return false;
-  const uri = from.match(/<\s*((?:sip|sips):[^>]+)>/i)?.[1]
-    ?? from.match(/((?:sip|sips):[^\s;,]+)/i)?.[1];
-  const user = uri?.match(/^(?:sip|sips):([^@;]+)@/i)?.[1];
-  return user === token;
-}
-
 export function createWebhookServer({
   unwrap,
   acceptCall,
-  authorizeCall = () => true,
   monitorCall,
-  rejectCall,
   logger = console,
   maxSeen = 1_000,
 }) {
@@ -282,13 +269,6 @@ export function createWebhookServer({
 
     let accepted = false;
     try {
-      /*if (!authorizeCall(event)) {
-        logger.warn(`Rejecting incoming Live session ${sessionId}: caller token did not match`);
-        if (typeof rejectCall === "function") await rejectCall(sessionId);
-        send(response, 200, "rejected\n");
-        return;
-      }*/
-      logger.log(`Caller token ignored.`);
       logger.log(`Verified incoming Live session ${sessionId}; accepting it...`);
       await acceptCall(sessionId);
       accepted = true;
@@ -304,16 +284,13 @@ export function createWebhookServer({
         if (error?.ambiguous) startMonitor();
       }
     } finally {
-      // A response already sent inside the try block is a final decision too.
-      const decided = accepted || response.writableEnded;
-      if (decided) {
+      if (accepted) {
         if (deliveryId) remember(seen, deliveryId);
         remember(decidedSessions, sessionId);
       }
       inFlight.delete(sessionId);
-      settle(decided);
+      settle(accepted);
     }
-    if (response.writableEnded) return;
     if (!accepted) {
       send(response, 502, "call acceptance failed\n");
       return;

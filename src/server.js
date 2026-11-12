@@ -6,13 +6,8 @@ import {
   STRIDEWELL_LIVE_INSTRUCTIONS,
   STRIDEWELL_TOOLS,
 } from "./stridewell-agent.js";
-import { assertPort, assertSipCallToken } from "./validation.js";
-import {
-  acceptLiveSession,
-  createWebhookServer,
-  hasSipCallToken,
-  rejectLiveSession,
-} from "./webhook.js";
+import { assertPort } from "./validation.js";
+import { acceptLiveSession, createWebhookServer } from "./webhook.js";
 
 function required(name) {
   const value = process.env[name];
@@ -27,7 +22,6 @@ function readPort() {
 try {
   const apiKey = required("OPENAI_API_KEY");
   const webhookSecret = required("OPENAI_WEBHOOK_SECRET");
-  const callToken = assertSipCallToken(required("SIP_CALL_TOKEN"));
   const client = new OpenAI({ apiKey, webhookSecret });
   const sessionMonitors = createSessionMonitors({
     apiKey,
@@ -48,9 +42,7 @@ try {
       backendInstructions: STRIDEWELL_BACKEND_INSTRUCTIONS,
       tools: STRIDEWELL_TOOLS,
     }),
-    authorizeCall: (event) => hasSipCallToken(event, callToken),
     monitorCall: (sessionId) => sessionMonitors.monitorCall(sessionId),
-    rejectCall: (sessionId) => rejectLiveSession(sessionId, { apiKey }),
   });
   server.on("close", () => {
     sessionMonitors.closeAll({ code: 1001, reason: "Webhook server shutting down" });

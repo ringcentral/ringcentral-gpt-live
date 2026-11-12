@@ -3,12 +3,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import test from "node:test";
 import OpenAI from "openai";
-import {
-  acceptLiveSession,
-  createWebhookServer,
-  hasSipCallToken,
-  rejectLiveSession,
-} from "../src/webhook.js";
+import { acceptLiveSession, createWebhookServer, rejectLiveSession } from "../src/webhook.js";
 
 async function listen(server) {
   server.listen(0, "127.0.0.1");
@@ -55,20 +50,6 @@ test("HTTP server logs every request with method, path, status, and duration", a
   assert.match(logs[1], /^HTTP PUT \/missing -> 404 \(\d+\.\dms\)$/);
   assert.match(logs[2], /^HTTP POST \/webhook -> 200 \(\d+\.\dms\)$/);
   assert.equal(logs.some((message) => message.includes("do-not-log")), false);
-});
-
-test("SIP call token is taken only from the From URI user", () => {
-  const event = {
-    data: {
-      sip_headers: [
-        { name: "To", value: "<sip:project@example.com>" },
-        { name: "From", value: '"Demo" <sip:0123456789abcdef@192.0.2.1>;tag=x' },
-      ],
-    },
-  };
-  assert.equal(hasSipCallToken(event, "0123456789abcdef"), true);
-  assert.equal(hasSipCallToken(event, "fedcba9876543210"), false);
-  assert.equal(hasSipCallToken({ data: {} }, "0123456789abcdef"), false);
 });
 
 test("real OpenAI SDK verification accepts and deduplicates a Live SIP webhook", async (t) => {
@@ -176,29 +157,6 @@ test("unrelated and non-SIP webhooks are acknowledged without acceptance", async
   assert.equal(await unrelated.text(), "ignored\n");
   assert.equal(await nonSip.text(), "ignored\n");
   assert.equal(accepted, false);
-});
-
-test("authorized-caller check rejects an unexpected SIP caller", async (t) => {
-  let accepted = false;
-  const rejected = [];
-  const server = createWebhookServer({
-    unwrap: async () => ({
-      id: "evt_unexpected",
-      type: "live.transport.incoming",
-      data: { type: "sip", session_id: "live_unexpected", sip_headers: [] },
-    }),
-    authorizeCall: () => false,
-    acceptCall: async () => { accepted = true; },
-    rejectCall: async (sessionId) => rejected.push(sessionId),
-    logger: quietLogger,
-  });
-  t.after(() => close(server));
-  const origin = await listen(server);
-  const response = await fetch(`${origin}/webhook`, { method: "POST", body: "{}" });
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), "rejected\n");
-  assert.equal(accepted, false);
-  assert.deepEqual(rejected, ["live_unexpected"]);
 });
 
 test("monitoring starts after acceptance and its failure does not fail the webhook", async (t) => {

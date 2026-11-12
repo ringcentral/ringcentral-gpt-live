@@ -33,11 +33,11 @@ GPT-Live handles the conversation. A separate Responses model decides which tool
    cp .env.example .env
    ```
 
-2. **Fill in `.env`.** All three values must come from the same OpenAI project:
+2. **Fill in `.env`.** The project ID and API key must come from the same OpenAI project:
 
    - `OPENAI_PROJECT_ID`: the `proj_...` ID under Settings → Project → General
    - `OPENAI_API_KEY`: a project key from Settings → Project → API Keys
-   - `SIP_CALL_TOKEN`: a random string that ties the caller to the webhook. Generate one with `openssl rand -hex 16`
+   - `SIP_CALL_TOKEN`: a random string the test caller sends as the user part of its SIP `From` address. Generate one with `openssl rand -hex 16`. The webhook server does not check it and accepts every signature-verified call.
 
 3. **Start a tunnel**
 
