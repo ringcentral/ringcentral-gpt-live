@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+*.log
+output/
+.idea/
+.DS_Store
+.npmrc
+*.pem
+audio/*.wav
+audio/*.mp3
